@@ -4,7 +4,7 @@ import os
 import secrets
 import time
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 
 import requests
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
@@ -16,7 +16,8 @@ VIDEO_PATH = ROOT / "static" / "bankai.mp4"
 
 X_AUTHORIZE_URL = "https://x.com/i/oauth2/authorize"
 X_TOKEN_URL = "https://api.x.com/2/oauth2/token"
-X_MEDIA_URL = "https://api.x.com/2/media/upload"
+X_MEDIA_INITIALIZE_URL = "https://api.x.com/2/media/upload/initialize"
+X_MEDIA_STATUS_URL = "https://api.x.com/2/media/upload"
 X_POST_URL = "https://api.x.com/2/tweets"
 X_ME_URL = "https://api.x.com/2/users/me"
 
@@ -73,7 +74,6 @@ def pkce_pair():
 
 
 def token_request(data):
-    """Token exchange/refresh for an X OAuth 2.0 confidential Web App."""
     cid = x_client_id()
     secret = x_client_secret()
     if not cid or not secret:
@@ -151,23 +151,25 @@ def upload_video():
 
     total_bytes = VIDEO_PATH.stat().st_size
 
-    # INIT
+    # 1) INITIALIZE
     r = x_request(
         "POST",
-        X_MEDIA_URL,
-        files={
-            "command": (None, "INIT"),
-            "media_type": (None, "video/mp4"),
-            "total_bytes": (None, str(total_bytes)),
-            "media_category": (None, "tweet_video"),
+        X_MEDIA_INITIALIZE_URL,
+        headers={"Content-Type": "application/json"},
+        json={
+            "media_type": "video/mp4",
+            "media_category": "tweet_video",
+            "total_bytes": total_bytes,
+            "shared": False,
         },
     )
     data = ensure_ok(r, "動画アップロード開始に失敗")
-    media_id = str((data.get("data") or {}).get("id") or data.get("media_id_string") or "")
+    media_id = str((data.get("data") or {}).get("id") or "")
     if not media_id:
         raise RuntimeError(f"Xからmedia_idを取得できませんでした: {data}")
 
-    # APPEND: 1 MiB chunks
+    # 2) APPEND
+    # X v2 append accepts base64 media string + segment_index in JSON.
     chunk_size = 1024 * 1024
     with VIDEO_PATH.open("rb") as f:
         segment = 0
@@ -178,33 +180,27 @@ def upload_video():
 
             r = x_request(
                 "POST",
-                X_MEDIA_URL,
-                data={
-                    "command": "APPEND",
-                    "media_id": media_id,
-                    "segment_index": str(segment),
-                },
-                files={
-                    "media": (f"bankai-{segment}.mp4", chunk, "application/octet-stream"),
+                f"https://api.x.com/2/media/upload/{media_id}/append",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "media": base64.b64encode(chunk).decode("ascii"),
+                    "segment_index": segment,
                 },
             )
             ensure_ok(r, f"動画チャンク{segment + 1}のアップロードに失敗")
             segment += 1
 
-    # FINALIZE
+    # 3) FINALIZE
     r = x_request(
         "POST",
-        X_MEDIA_URL,
-        files={
-            "command": (None, "FINALIZE"),
-            "media_id": (None, media_id),
-        },
+        f"https://api.x.com/2/media/upload/{media_id}/finalize",
     )
     final_data = ensure_ok(r, "動画アップロード確定に失敗")
+
     processing = (final_data.get("data") or {}).get("processing_info") or {}
     state = processing.get("state")
 
-    # STATUS
+    # 4) STATUS
     deadline = time.time() + 180
     while state in ("pending", "in_progress") and time.time() < deadline:
         wait_seconds = max(1, int(processing.get("check_after_secs", 1)))
@@ -212,11 +208,8 @@ def upload_video():
 
         r = x_request(
             "GET",
-            X_MEDIA_URL,
-            params={
-                "command": "STATUS",
-                "media_id": media_id,
-            },
+            X_MEDIA_STATUS_URL,
+            params={"media_id": media_id},
         )
         status_data = ensure_ok(r, "X側の動画処理確認に失敗")
         processing = (status_data.get("data") or {}).get("processing_info") or {}
@@ -293,7 +286,12 @@ def login():
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
-    return redirect(X_AUTHORIZE_URL + "?" + urlencode(params))
+
+    # IMPORTANT:
+    # X requires RFC3986 percent encoding. quote_plus() would turn spaces
+    # into "+"; using quote makes scope spaces "%20".
+    query = urlencode(params, quote_via=quote)
+    return redirect(X_AUTHORIZE_URL + "?" + query)
 
 
 @app.get("/callback")
@@ -325,7 +323,6 @@ def callback():
         })
         save_tokens(payload)
 
-        # Display the connected account if possible.
         try:
             r = x_request("GET", X_ME_URL)
             me = ensure_ok(r, "アカウント情報取得に失敗")
